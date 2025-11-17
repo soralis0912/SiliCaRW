@@ -11,12 +11,33 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import jp.muo.silicarw.ui.theme.SiliCaRWTheme
+
+enum class WriteCommandType(val label: String) {
+    IDM("IDm / PMm"),
+    SYSTEM_CODES("System Codes"),
+    SERVICE_CODES("Service Codes"),
+    RAW_BLOCK("Raw Block")
+}
 
 class MainActivity : ComponentActivity() {
     private var nfcAdapter: NfcAdapter? = null
@@ -24,35 +45,136 @@ class MainActivity : ComponentActivity() {
 
     private var statusMessage by mutableStateOf("初期化中...")
     private var currentIdm by mutableStateOf("")
-    private var inputIdm by mutableStateOf("DEADBEEF01010101")
+    private var idmInput by mutableStateOf("DEADBEEF01010101")
+    private var pmmInput by mutableStateOf("")
+    private var systemCodesInput by mutableStateOf("")
+    private var serviceCodesInput by mutableStateOf("")
+    private var rawBlockNumberInput by mutableStateOf("0")
+    private var rawDataInput by mutableStateOf("")
+    private var selectedCommand by mutableStateOf(WriteCommandType.IDM)
     private var isWriteMode by mutableStateOf(false)
-    private var pendingWriteIdm by mutableStateOf("")
+    private var pendingWriteRequest by mutableStateOf<WriteRequest?>(null)
     private var debugInfo by mutableStateOf("")
 
     companion object {
         private const val TAG = "NFCWriter"
         private const val COMMAND_WRITE = 0x08.toByte()
+        private const val MAX_SYSTEM = 4
+        private const val MAX_SERVICE = 4
         private val DEFAULT_PMM = byteArrayOf(0x00, 0x01, 0xFF.toByte(), 0xFF.toByte(),
                                                0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte())
     }
 
-    private fun onWriteButtonClick(hexIdm: String) {
-        Log.d(TAG, "onWriteButtonClick called with IDm: $hexIdm")
+    private data class WriteRequest(
+        val block: Int,
+        val data: ByteArray,
+        val description: String,
+        val verifyIdm: ByteArray? = null
+    )
 
-        if (!isValidHex(hexIdm) || hexIdm.length != 16) {
-            Log.e(TAG, "Invalid IDm format: $hexIdm")
-            statusMessage = "エラー: IDmは16桁の16進数で入力してください"
-            return
-        }
-
+    private fun onWriteButtonClick() {
+        val request = buildWriteRequest(reportErrors = true) ?: return
+        Log.d(TAG, "Prepared write request: ${request.description} block=${request.block}")
         isWriteMode = true
-        pendingWriteIdm = hexIdm
-        statusMessage = "書き込み待機中...\nタグをかざしてください"
+        pendingWriteRequest = request
+        statusMessage = "書き込み待機中...\n${request.description}\nタグをかざしてください"
         Log.d(TAG, "Write mode activated, waiting for tag...")
     }
 
     private fun isValidHex(hex: String): Boolean {
-        return hex.all { it in '0'..'9' || it in 'A'..'F' || it in 'a'..'f' }
+        return hex.all { it in '0'..'9' || it in 'A'..'F' }
+    }
+
+    private fun buildWriteRequest(reportErrors: Boolean): WriteRequest? {
+        fun fail(message: String): WriteRequest? {
+            if (reportErrors) {
+                statusMessage = "エラー: $message"
+                debugInfo = "Validation error"
+            }
+            return null
+        }
+
+        fun sanitize(raw: String, allowEmpty: Boolean = false): String? {
+            val cleaned = raw.uppercase().replace(" ", "").replace(",", "")
+            if (cleaned.isEmpty()) {
+                return if (allowEmpty) "" else null
+            }
+            return if (isValidHex(cleaned)) cleaned else null
+        }
+
+        return when (selectedCommand) {
+            WriteCommandType.IDM -> {
+                val cleanIdm = sanitize(idmInput) ?: return fail("IDmは16桁の16進数で入力してください")
+                if (cleanIdm.length != 16) return fail("IDmは16桁の16進数で入力してください")
+                val idmBytes = hexStringToByteArray(cleanIdm)
+
+                val cleanPmm = sanitize(pmmInput, allowEmpty = true)
+                    ?: return fail("PMmは16桁の16進数で入力してください")
+                val pmmBytes = if (cleanPmm.isEmpty()) {
+                    DEFAULT_PMM
+                } else {
+                    if (cleanPmm.length != 16) return fail("PMmは16桁の16進数で入力してください")
+                    hexStringToByteArray(cleanPmm)
+                }
+
+                WriteRequest(
+                    block = 0x83,
+                    data = idmBytes + pmmBytes,
+                    description = "IDm/PMm 書き込み",
+                    verifyIdm = idmBytes
+                )
+            }
+
+            WriteCommandType.SYSTEM_CODES -> {
+                val clean = sanitize(systemCodesInput) ?: return fail("システムコードは16進数で入力してください")
+                if (clean.length % 4 != 0) return fail("システムコードは2バイト（4桁）単位で入力してください")
+                val codeCount = clean.length / 4
+                if (codeCount == 0 || codeCount > MAX_SYSTEM) {
+                    return fail("システムコードは1〜${MAX_SYSTEM}個まで設定できます")
+                }
+                val bytes = hexStringToByteArray(clean)
+                WriteRequest(
+                    block = 0x85,
+                    data = padToBlock(bytes),
+                    description = "System Codes 書き込み"
+                )
+            }
+
+            WriteCommandType.SERVICE_CODES -> {
+                val clean = sanitize(serviceCodesInput) ?: return fail("サービスコードは16進数で入力してください")
+                if (clean.length % 4 != 0) return fail("サービスコードは2バイト（4桁）単位で入力してください")
+                val codeCount = clean.length / 4
+                if (codeCount == 0 || codeCount > MAX_SERVICE) {
+                    return fail("サービスコードは1〜${MAX_SERVICE}個まで設定できます")
+                }
+                val rawBytes = hexStringToByteArray(clean)
+                val swapped = ByteArray(rawBytes.size)
+                for (i in rawBytes.indices step 2) {
+                    swapped[i] = rawBytes[i + 1]
+                    swapped[i + 1] = rawBytes[i]
+                }
+                WriteRequest(
+                    block = 0x84,
+                    data = padToBlock(swapped),
+                    description = "Service Codes 書き込み"
+                )
+            }
+
+            WriteCommandType.RAW_BLOCK -> {
+                val blockNumber = rawBlockNumberInput.toIntOrNull()
+                    ?: return fail("ブロック番号は数値で入力してください")
+                if (blockNumber !in 0..11) return fail("ブロック番号は0〜11の範囲で入力してください")
+
+                val clean = sanitize(rawDataInput) ?: return fail("データは16進数で入力してください")
+                if (clean.length != 32) return fail("データは32桁（16バイト）で入力してください")
+
+                WriteRequest(
+                    block = blockNumber,
+                    data = hexStringToByteArray(clean),
+                    description = "Raw Block $blockNumber 書き込み"
+                )
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,15 +206,29 @@ class MainActivity : ComponentActivity() {
 
         enableEdgeToEdge()
         setContent {
+            val canWrite = !isWriteMode && buildWriteRequest(reportErrors = false) != null
             SiliCaRWTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     NFCWriterScreen(
                         statusMessage = statusMessage,
                         currentIdm = currentIdm,
-                        inputIdm = inputIdm,
-                        onInputIdmChange = { inputIdm = it },
-                        onWriteClick = { onWriteButtonClick(inputIdm) },
+                        selectedCommand = selectedCommand,
+                        onCommandChange = { selectedCommand = it },
+                        idmInput = idmInput,
+                        onInputIdmChange = { idmInput = it },
+                        pmmInput = pmmInput,
+                        onPmmChange = { pmmInput = it },
+                        systemCodesInput = systemCodesInput,
+                        onSystemCodesChange = { systemCodesInput = it },
+                        serviceCodesInput = serviceCodesInput,
+                        onServiceCodesChange = { serviceCodesInput = it },
+                        rawBlockNumberInput = rawBlockNumberInput,
+                        onRawBlockNumberChange = { rawBlockNumberInput = it },
+                        rawDataInput = rawDataInput,
+                        onRawDataChange = { rawDataInput = it },
+                        onWriteClick = { onWriteButtonClick() },
                         isWriteMode = isWriteMode,
+                        isWriteButtonEnabled = canWrite,
                         debugInfo = debugInfo,
                         modifier = Modifier.padding(innerPadding)
                     )
@@ -204,66 +340,63 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "Manufacturer: ${nfcF.manufacturer.toHexString()}")
             Log.d(TAG, "System Code: ${nfcF.systemCode.toHexString()}")
 
-            if (isWriteMode && pendingWriteIdm.isNotEmpty()) {
-                // 書き込みモード
-                Log.d(TAG, "Write mode active, pending IDm: $pendingWriteIdm")
+            val pendingRequest = pendingWriteRequest
+            if (isWriteMode && pendingRequest != null) {
+                Log.d(TAG, "Write mode active for ${pendingRequest.description}")
                 debugInfo = "Writing..."
-                statusMessage = "現在のIDm: ${currentIdm}\n書き込み中..."
+                statusMessage = "現在のIDm: ${currentIdm}\n${pendingRequest.description}実行中..."
 
-                val newIdm = hexStringToByteArray(pendingWriteIdm)
-                Log.d(TAG, "New IDm bytes: ${newIdm.toHexString()}")
-
-                // 書き込み対象のIDm = 現在読み取ったIDmの場合、既に書き込み済み
-                if (currentIdm.equals(newIdm.toHexString(), ignoreCase = true)) {
+                val targetIdmHex = pendingRequest.verifyIdm?.toHexString()
+                if (targetIdmHex != null && currentIdm.equals(targetIdmHex, ignoreCase = true)) {
                     statusMessage = "書き込み済み\n現在のIDm: $currentIdm"
-                    Log.d(TAG, "IDm already matches target - write already successful")
                     debugInfo = "Already Written"
-                } else {
-                    // 書き込み実行
-                    val oldIdmForDisplay = currentIdm
-                    writeIdm(nfcF, idm, newIdm)
-
-                    // 書き込み後、タグを切断して再接続し、IDmを確認
-                    try {
-                        nfcF.close()
-                        shouldCloseConnection = false  // 既にクローズ済み
-                        Thread.sleep(100)  // 短い待機
-                        nfcF.connect()
-
-                        // 書き込み後のIDmを読み取り
-                        val newReadIdm = nfcF.tag.id.toHexString()
-                        currentIdm = newReadIdm
-                        Log.d(TAG, "After write, IDm: $newReadIdm")
-
-                        // 新しいIDmと一致しているか確認
-                        if (newReadIdm.equals(newIdm.toHexString(), ignoreCase = true)) {
-                            statusMessage = "書き込み成功!\n" +
-                                    "旧IDm: $oldIdmForDisplay\n" +
-                                    "新IDm: $newReadIdm"
-                            Log.d(TAG, "Write successful - IDm matches")
-                            debugInfo = "Write OK"
-                        } else {
-                            statusMessage = "書き込み失敗\n" +
-                                    "期待: ${newIdm.toHexString()}\n" +
-                                    "実際: $newReadIdm"
-                            Log.e(TAG, "Write failed - IDm mismatch")
-                            debugInfo = "Write FAILED"
-                        }
-
-                        // 再接続したので、再度クローズが必要
-                        shouldCloseConnection = true
-                    } catch (e: Exception) {
-                        // 再接続失敗時は警告だけ表示
-                        Log.w(TAG, "Could not verify write result: ${e.message}")
-                        statusMessage = "書き込み完了\n（確認失敗）\n対象IDm: ${newIdm.toHexString()}"
-                        debugInfo = "Write Done (unverified)"
-                        shouldCloseConnection = false  // 既にクローズ済み
-                    }
+                    isWriteMode = false
+                    pendingWriteRequest = null
+                    return
                 }
 
-                // 書き込みモードをリセット
+                val writeSuccess = writeBlock(nfcF, idm, pendingRequest.block, pendingRequest.data)
+                if (writeSuccess) {
+                    if (pendingRequest.verifyIdm != null) {
+                        val targetIdm = pendingRequest.verifyIdm.toHexString()
+
+                        // 書き込み後、タグを切断して再接続し、IDmを確認
+                        val oldIdmForDisplay = currentIdm
+                        try {
+                            nfcF.close()
+                            shouldCloseConnection = false
+                            Thread.sleep(100)
+                            nfcF.connect()
+
+                            val newReadIdm = nfcF.tag.id.toHexString()
+                            currentIdm = newReadIdm
+                            Log.d(TAG, "After write, IDm: $newReadIdm")
+
+                            if (newReadIdm.equals(targetIdm, ignoreCase = true)) {
+                                statusMessage = "書き込み成功!\n旧IDm: $oldIdmForDisplay\n新IDm: $newReadIdm"
+                                debugInfo = "Write OK"
+                            } else {
+                                statusMessage = "書き込み失敗\n期待: $targetIdm\n実際: $newReadIdm"
+                                debugInfo = "Write FAILED"
+                            }
+                            shouldCloseConnection = true
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Could not verify write result: ${e.message}")
+                            statusMessage = "書き込み完了\n（確認失敗）\n対象IDm: $targetIdm"
+                            debugInfo = "Write Done (unverified)"
+                            shouldCloseConnection = false
+                        }
+                    } else {
+                        statusMessage = "書き込み成功\n${pendingRequest.description}"
+                        debugInfo = "Write OK"
+                    }
+                } else {
+                    statusMessage = "書き込み失敗\n${pendingRequest.description}"
+                    debugInfo = "Write FAILED"
+                }
+
                 isWriteMode = false
-                pendingWriteIdm = ""
+                pendingWriteRequest = null
             } else {
                 // 読み取り専用モード
                 Log.d(TAG, "Read-only mode, displaying IDm")
@@ -276,7 +409,7 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "Error handling tag", e)
             debugInfo = "Error: ${e.message}"
             isWriteMode = false
-            pendingWriteIdm = ""
+            pendingWriteRequest = null
         } finally {
             if (shouldCloseConnection) {
                 try {
@@ -288,42 +421,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun hexStringToByteArray(hex: String): ByteArray {
-        val cleanHex = hex.uppercase().replace(" ", "")
-        return ByteArray(cleanHex.length / 2) { i ->
-            cleanHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+    private fun writeBlock(nfcF: NfcF, currentIdm: ByteArray, block: Int, data: ByteArray): Boolean {
+        if (block !in 0..0xFF) {
+            Log.e(TAG, "Invalid block number: $block")
+            return false
         }
-    }
+        if (data.size != 16) {
+            Log.e(TAG, "Data must be exactly 16 bytes, got ${data.size}")
+            return false
+        }
 
-    private fun writeIdm(nfcF: NfcF, currentIdm: ByteArray, newIdm: ByteArray): Boolean {
-        val blockNum = 0x83.toByte()
-        val data = newIdm + DEFAULT_PMM  // 8 bytes IDm + 8 bytes PMm = 16 bytes
-
-        // コマンドデータの構築: [1, 0xFF, 0xFF, 1, 0x80, block_num] + data
         val cmdData = byteArrayOf(
             0x01,           // service count
             0xFF.toByte(),  // service code (little endian)
             0xFF.toByte(),
             0x01,           // block count
             0x80.toByte(),  // block list element (2-byte mode)
-            blockNum        // block number
+            block.toByte()  // block number
         ) + data
 
-        // 完全なFeliCaコマンドの構築
-        // [length] [command] [IDm] [service count] [service code] [block count] [block list] [data]
         val command = byteArrayOf(
-            (1 + 1 + currentIdm.size + cmdData.size).toByte(),  // length
-            COMMAND_WRITE                                        // command code
+            (1 + 1 + currentIdm.size + cmdData.size).toByte(),
+            COMMAND_WRITE
         ) + currentIdm + cmdData
 
-        Log.d(TAG, "Sending command: ${command.toHexString()}")
+        Log.d(TAG, "Sending block $block write command: ${command.toHexString()}")
 
         return try {
             val response = nfcF.transceive(command)
             Log.d(TAG, "Response: ${response.toHexString()}")
 
-            // レスポンスチェック
-            // 成功の場合: [length] [response_code] [IDm] [status_flag1] [status_flag2]
             if (response.size >= 11 && response[1] == 0x09.toByte()) {
                 val statusFlag1 = response[9]
                 val statusFlag2 = response[10]
@@ -337,8 +464,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun padToBlock(bytes: ByteArray): ByteArray {
+        return if (bytes.size >= 16) {
+            bytes.copyOf(16)
+        } else {
+            bytes + ByteArray(16 - bytes.size)
+        }
+    }
+
     private fun ByteArray.toHexString(): String {
         return this.joinToString("") { "%02X".format(it) }
+    }
+
+    private fun hexStringToByteArray(hex: String): ByteArray {
+        require(hex.length % 2 == 0) { "Hex string must have an even length" }
+        return ByteArray(hex.length / 2) { i ->
+            hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
     }
 }
 
@@ -346,28 +488,41 @@ class MainActivity : ComponentActivity() {
 fun NFCWriterScreen(
     statusMessage: String,
     currentIdm: String,
-    inputIdm: String,
+    selectedCommand: WriteCommandType,
+    onCommandChange: (WriteCommandType) -> Unit,
+    idmInput: String,
     onInputIdmChange: (String) -> Unit,
+    pmmInput: String,
+    onPmmChange: (String) -> Unit,
+    systemCodesInput: String,
+    onSystemCodesChange: (String) -> Unit,
+    serviceCodesInput: String,
+    onServiceCodesChange: (String) -> Unit,
+    rawBlockNumberInput: String,
+    onRawBlockNumberChange: (String) -> Unit,
+    rawDataInput: String,
+    onRawDataChange: (String) -> Unit,
     onWriteClick: () -> Unit,
     isWriteMode: Boolean,
+    isWriteButtonEnabled: Boolean,
     debugInfo: String,
     modifier: Modifier = Modifier
 ) {
+    val scrollState = rememberScrollState()
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(scrollState)
             .padding(16.dp),
-        horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Top
     ) {
         Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
+            modifier = Modifier.fillMaxWidth()
         ) {
             Column(
                 modifier = Modifier.padding(16.dp),
-                horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+                horizontalAlignment = Alignment.Start
             ) {
                 Text(
                     text = "SiliCa Tag Writer",
@@ -375,7 +530,6 @@ fun NFCWriterScreen(
                     modifier = Modifier.padding(bottom = 8.dp)
                 )
 
-                // デバッグ情報
                 Text(
                     text = debugInfo,
                     style = MaterialTheme.typography.labelSmall,
@@ -383,7 +537,6 @@ fun NFCWriterScreen(
                     modifier = Modifier.padding(bottom = 8.dp)
                 )
 
-                // ステータス表示
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -402,33 +555,132 @@ fun NFCWriterScreen(
                     )
                 }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
-                // IDm入力フィールド
-                OutlinedTextField(
-                    value = inputIdm,
-                    onValueChange = { newValue ->
-                        // 16進数のみ受け付ける
-                        if (newValue.all { it in '0'..'9' || it in 'A'..'F' || it in 'a'..'f' }) {
-                            onInputIdmChange(newValue.uppercase())
-                        }
-                    },
-                    label = { Text("新しいIDm (16桁16進数)") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    enabled = !isWriteMode,
-                    supportingText = {
-                        Text("例: DEADBEEF01010101 (8バイト)")
-                    }
+                Text(
+                    text = "書き込み対象",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(bottom = 8.dp)
                 )
+                WriteCommandType.values().forEach { type ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clickable(enabled = !isWriteMode) { onCommandChange(type) },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = selectedCommand == type,
+                            onClick = { onCommandChange(type) },
+                            enabled = !isWriteMode
+                        )
+                        Text(
+                            text = type.label,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.padding(start = 8.dp)
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // 書き込みボタン
+                when (selectedCommand) {
+                    WriteCommandType.IDM -> {
+                        OutlinedTextField(
+                            value = idmInput,
+                            onValueChange = { newValue ->
+                                tryAcceptHexInput(newValue, 16)?.let(onInputIdmChange)
+                            },
+                            label = { Text("新しいIDm (16桁16進数)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            enabled = !isWriteMode,
+                            supportingText = { Text("例: DEADBEEF01010101 (8バイト)") }
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        OutlinedTextField(
+                            value = pmmInput,
+                            onValueChange = { newValue ->
+                                tryAcceptHexInput(newValue, 16)?.let(onPmmChange)
+                            },
+                            label = { Text("PMm (任意 16桁)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            enabled = !isWriteMode,
+                            supportingText = { Text("省略時はデフォルト値を使用します") }
+                        )
+                    }
+
+                    WriteCommandType.SYSTEM_CODES -> {
+                        OutlinedTextField(
+                            value = systemCodesInput,
+                            onValueChange = { newValue ->
+                                tryAcceptHexInput(newValue, 16)?.let(onSystemCodesChange)
+                            },
+                            label = { Text("System Codes") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            enabled = !isWriteMode,
+                            supportingText = { Text("最大4件・各4桁 (例: 12FC8000)") }
+                        )
+                    }
+
+                    WriteCommandType.SERVICE_CODES -> {
+                        OutlinedTextField(
+                            value = serviceCodesInput,
+                            onValueChange = { newValue ->
+                                tryAcceptHexInput(newValue, 16)?.let(onServiceCodesChange)
+                            },
+                            label = { Text("Service Codes") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            enabled = !isWriteMode,
+                            supportingText = { Text("最大4件・各4桁 (例: 100B200B)") }
+                        )
+                    }
+
+                    WriteCommandType.RAW_BLOCK -> {
+                        OutlinedTextField(
+                            value = rawBlockNumberInput,
+                            onValueChange = { newValue ->
+                                if (newValue.length <= 2 && newValue.all { it.isDigit() }) {
+                                    onRawBlockNumberChange(newValue)
+                                } else if (newValue.isEmpty()) {
+                                    onRawBlockNumberChange("")
+                                }
+                            },
+                            label = { Text("ブロック番号 (0〜11)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            enabled = !isWriteMode,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        OutlinedTextField(
+                            value = rawDataInput,
+                            onValueChange = { newValue ->
+                                tryAcceptHexInput(newValue, 32)?.let(onRawDataChange)
+                            },
+                            label = { Text("16バイトのデータ (32桁16進数)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            enabled = !isWriteMode,
+                            supportingText = { Text("例: 00112233445566778899AABBCCDDEEFF") }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
                 Button(
                     onClick = onWriteClick,
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = !isWriteMode && inputIdm.length == 16
+                    enabled = isWriteButtonEnabled
                 ) {
                     Text(
                         text = if (isWriteMode) "書き込み待機中..." else "Write",
@@ -454,4 +706,20 @@ fun NFCWriterScreen(
             }
         }
     }
+}
+
+private fun tryAcceptHexInput(newValue: String, maxLength: Int? = null): String? {
+    val candidate = newValue.uppercase()
+    if (!candidate.all { it.isHexDigitChar() }) {
+        return null
+    }
+    if (maxLength != null && candidate.length > maxLength) {
+        return null
+    }
+    return candidate
+}
+
+private fun Char.isHexDigitChar(): Boolean {
+    val upper = this.uppercaseChar()
+    return upper in '0'..'9' || upper in 'A'..'F'
 }
