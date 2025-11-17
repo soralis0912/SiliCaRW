@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -54,9 +55,15 @@ class MainActivity : ComponentActivity() {
     private var rawDataInput by mutableStateOf("")
     private var selectedCommand by mutableStateOf(WriteCommandType.IDM)
     private var isWriteMode by mutableStateOf(false)
+    private var isReadMode by mutableStateOf(false)
     private var pendingWriteRequest by mutableStateOf<WriteRequest?>(null)
     private var debugInfo by mutableStateOf("")
     private var lastErrorCommand by mutableStateOf("未取得")
+    private var readOptionLastError by mutableStateOf(true)
+    private var readOptionSystemCodes by mutableStateOf(false)
+    private var readOptionServiceCodes by mutableStateOf(false)
+    private var readOptionCustomBlock by mutableStateOf(false)
+    private var readCustomBlockNumber by mutableStateOf("0")
 
     companion object {
         private const val TAG = "NFCWriter"
@@ -64,6 +71,7 @@ class MainActivity : ComponentActivity() {
         private const val COMMAND_WRITE = 0x08.toByte()
         private const val MAX_SYSTEM = 4
         private const val MAX_SERVICE = 4
+        private const val IDLE_STATUS_MESSAGE = "ReadまたはWriteボタンを押してからタグをかざしてください"
         private val DEFAULT_PMM = byteArrayOf(0x00, 0x01, 0xFF.toByte(), 0xFF.toByte(),
                                                0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte())
     }
@@ -80,13 +88,39 @@ class MainActivity : ComponentActivity() {
         val errorMessage: String? = null
     )
 
+    private fun setIdleStatus() {
+        statusMessage = IDLE_STATUS_MESSAGE
+        debugInfo = "Idle"
+    }
+
     private fun onWriteButtonClick() {
         val request = buildWriteRequest(reportErrors = true) ?: return
         Log.d(TAG, "Prepared write request: ${request.description} block=${request.block}")
         isWriteMode = true
+        isReadMode = false
         pendingWriteRequest = request
         statusMessage = "書き込み待機中...\n${request.description}\nタグをかざしてください"
         Log.d(TAG, "Write mode activated, waiting for tag...")
+    }
+
+    private fun onReadButtonClick() {
+        Log.d(TAG, "onReadButtonClick called")
+        isReadMode = true
+        isWriteMode = false
+        pendingWriteRequest = null
+        statusMessage = "読み取り待機中...\nタグをかざしてください"
+        debugInfo = "Read mode waiting"
+    }
+
+    private fun cancelPendingOperation() {
+        if (!isReadMode && !isWriteMode) {
+            return
+        }
+        Log.d(TAG, "Cancelling pending operation")
+        isReadMode = false
+        isWriteMode = false
+        pendingWriteRequest = null
+        setIdleStatus()
     }
 
     private fun isValidHex(hex: String): Boolean {
@@ -202,7 +236,7 @@ class MainActivity : ComponentActivity() {
             debugInfo = "NFC: Disabled"
         } else {
             Log.d(TAG, "NFC is available and enabled")
-            statusMessage = "NFCタグを待機中..."
+            setIdleStatus()
             debugInfo = "NFC: Enabled & Ready"
         }
 
@@ -214,7 +248,9 @@ class MainActivity : ComponentActivity() {
 
         enableEdgeToEdge()
         setContent {
-            val canWrite = !isWriteMode && buildWriteRequest(reportErrors = false) != null
+            val canWrite = !isWriteMode && !isReadMode && buildWriteRequest(reportErrors = false) != null
+            val canRead = !isReadMode && !isWriteMode
+            val canCancel = isReadMode || isWriteMode
             SiliCaRWTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     NFCWriterScreen(
@@ -234,9 +270,24 @@ class MainActivity : ComponentActivity() {
                         onRawBlockNumberChange = { rawBlockNumberInput = it },
                         rawDataInput = rawDataInput,
                         onRawDataChange = { rawDataInput = it },
+                        readOptionLastError = readOptionLastError,
+                        onReadOptionLastErrorChange = { readOptionLastError = it },
+                        readOptionSystemCodes = readOptionSystemCodes,
+                        onReadOptionSystemCodesChange = { readOptionSystemCodes = it },
+                        readOptionServiceCodes = readOptionServiceCodes,
+                        onReadOptionServiceCodesChange = { readOptionServiceCodes = it },
+                        readOptionCustomBlock = readOptionCustomBlock,
+                        onReadOptionCustomBlockChange = { readOptionCustomBlock = it },
+                        readCustomBlockNumber = readCustomBlockNumber,
+                        onReadCustomBlockNumberChange = { readCustomBlockNumber = it },
+                        onReadClick = { onReadButtonClick() },
                         onWriteClick = { onWriteButtonClick() },
+                        onCancelClick = { cancelPendingOperation() },
                         isWriteMode = isWriteMode,
+                        isReadMode = isReadMode,
+                        isReadButtonEnabled = canRead,
                         isWriteButtonEnabled = canWrite,
+                        isCancelButtonEnabled = canCancel,
                         debugInfo = debugInfo,
                         lastErrorCommand = lastErrorCommand,
                         modifier = Modifier.padding(innerPadding)
@@ -323,6 +374,12 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "handleTag called")
         Log.d(TAG, "Tag ID: ${tag.id.toHexString()}")
         Log.d(TAG, "Tag technologies: ${tag.techList.joinToString()}")
+
+        if (!isReadMode && !isWriteMode) {
+            Log.d(TAG, "No pending operation – ignoring tag")
+            setIdleStatus()
+            return
+        }
         debugInfo = "Tag detected!"
 
         val nfcF = NfcF.get(tag)
@@ -348,16 +405,6 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "Current IDm: $currentIdm")
             Log.d(TAG, "Manufacturer: ${nfcF.manufacturer.toHexString()}")
             Log.d(TAG, "System Code: ${nfcF.systemCode.toHexString()}")
-
-            // エラーコマンド履歴を取得
-            val errorCommand = fetchLastErrorCommand(nfcF, idm)
-            if (errorCommand != null) {
-                lastErrorCommand = errorCommand
-                Log.d(TAG, "Last error command: $errorCommand")
-            } else {
-                lastErrorCommand = "取得失敗"
-                Log.w(TAG, "Unable to read last error command")
-            }
 
             val pendingRequest = pendingWriteRequest
             if (isWriteMode && pendingRequest != null) {
@@ -417,11 +464,42 @@ class MainActivity : ComponentActivity() {
 
                 isWriteMode = false
                 pendingWriteRequest = null
+            } else if (isReadMode) {
+                Log.d(TAG, "Manual read mode active")
+                val outputs = mutableListOf("IDm: $currentIdm")
+
+                if (readOptionLastError) {
+                    val lastError = fetchLastErrorCommand(nfcF, idm)
+                    if (lastError != null) {
+                        lastErrorCommand = lastError
+                        outputs += "Last Error: $lastError"
+                    } else {
+                        lastErrorCommand = "取得失敗"
+                        outputs += "Last Error: 取得失敗"
+                    }
+                }
+
+                if (readOptionSystemCodes) {
+                    val codes = readCodeListBlock(nfcF, idm, blockNumber = 0x85, swapBytes = false)
+                    outputs += "System Codes: ${formatCodeListDisplay(codes)}"
+                }
+
+                if (readOptionServiceCodes) {
+                    val codes = readCodeListBlock(nfcF, idm, blockNumber = 0x84, swapBytes = true)
+                    outputs += "Service Codes: ${formatCodeListDisplay(codes)}"
+                }
+
+                if (readOptionCustomBlock) {
+                    outputs += readCustomBlockDisplay(nfcF, idm)
+                }
+
+                val summary = outputs.joinToString("\n")
+                statusMessage = "読み取り結果:\n$summary"
+                debugInfo = "Manual Read OK"
+                isReadMode = false
             } else {
-                // 読み取り専用モード
-                Log.d(TAG, "Read-only mode, displaying IDm")
-                statusMessage = "タグ検出\n現在のIDm: $currentIdm"
-                debugInfo = "Read OK"
+                Log.w(TAG, "Tag received but no active operation")
+                setIdleStatus()
             }
 
         } catch (e: Exception) {
@@ -429,6 +507,7 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "Error handling tag", e)
             debugInfo = "Error: ${e.message}"
             isWriteMode = false
+            isReadMode = false
             pendingWriteRequest = null
         } finally {
             if (shouldCloseConnection) {
@@ -573,6 +652,70 @@ class MainActivity : ComponentActivity() {
         return bytes.joinToString(" ") { "%02X".format(it) }
     }
 
+    private fun readSingleSystemBlock(
+        nfcF: NfcF,
+        currentIdm: ByteArray,
+        blockNumber: Int
+    ): ByteArray? {
+        if (blockNumber !in 0..0xFF) {
+            return null
+        }
+        val blockList = byteArrayOf(0x80.toByte(), blockNumber.toByte())
+        return readSystemBlocks(nfcF, currentIdm, blockList)
+    }
+
+    private fun readCodeListBlock(
+        nfcF: NfcF,
+        currentIdm: ByteArray,
+        blockNumber: Int,
+        swapBytes: Boolean
+    ): List<String>? {
+        val blockData = readSingleSystemBlock(nfcF, currentIdm, blockNumber) ?: return null
+        if (blockData.isEmpty()) {
+            return emptyList()
+        }
+
+        val codes = mutableListOf<String>()
+        var index = 0
+        while (index + 1 < blockData.size) {
+            val first = blockData[index]
+            val second = blockData[index + 1]
+            if (first == 0.toByte() && second == 0.toByte()) {
+                break
+            }
+            val pair = if (swapBytes) {
+                byteArrayOf(second, first)
+            } else {
+                byteArrayOf(first, second)
+            }
+            codes += pair.toHexString()
+            index += 2
+        }
+        return codes
+    }
+
+    private fun formatCodeListDisplay(codes: List<String>?): String {
+        return when {
+            codes == null -> "読み取り失敗"
+            codes.isEmpty() -> "なし"
+            else -> codes.joinToString(", ")
+        }
+    }
+
+    private fun readCustomBlockDisplay(nfcF: NfcF, currentIdm: ByteArray): String {
+        val blockNumber = readCustomBlockNumber.toIntOrNull()
+        if (blockNumber == null || blockNumber !in 0..0xFF) {
+            return "Block: 無効な番号"
+        }
+        val label = "Block %02X".format(blockNumber)
+        val data = readSingleSystemBlock(nfcF, currentIdm, blockNumber)
+        return if (data != null) {
+            "$label: ${data.toHexString()}"
+        } else {
+            "$label: 読み取り失敗"
+        }
+    }
+
     private fun padToBlock(bytes: ByteArray): ByteArray {
         return if (bytes.size >= 16) {
             bytes.copyOf(16)
@@ -611,14 +754,44 @@ fun NFCWriterScreen(
     onRawBlockNumberChange: (String) -> Unit,
     rawDataInput: String,
     onRawDataChange: (String) -> Unit,
+    readOptionLastError: Boolean,
+    onReadOptionLastErrorChange: (Boolean) -> Unit,
+    readOptionSystemCodes: Boolean,
+    onReadOptionSystemCodesChange: (Boolean) -> Unit,
+    readOptionServiceCodes: Boolean,
+    onReadOptionServiceCodesChange: (Boolean) -> Unit,
+    readOptionCustomBlock: Boolean,
+    onReadOptionCustomBlockChange: (Boolean) -> Unit,
+    readCustomBlockNumber: String,
+    onReadCustomBlockNumberChange: (String) -> Unit,
+    onReadClick: () -> Unit,
     onWriteClick: () -> Unit,
+    onCancelClick: () -> Unit,
     isWriteMode: Boolean,
+    isReadMode: Boolean,
+    isReadButtonEnabled: Boolean,
     isWriteButtonEnabled: Boolean,
+    isCancelButtonEnabled: Boolean,
     debugInfo: String,
     lastErrorCommand: String,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
+    val controlsEnabled = !isReadMode && !isWriteMode
+    fun handleCustomBlockInput(newValue: String) {
+        if (!controlsEnabled) return
+        if (newValue.isEmpty()) {
+            onReadCustomBlockNumberChange("")
+            return
+        }
+        if (newValue.length > 3 || newValue.any { !it.isDigit() }) {
+            return
+        }
+        val parsed = newValue.toIntOrNull()
+        if (parsed != null && parsed in 0..255) {
+            onReadCustomBlockNumberChange(parsed.toString())
+        }
+    }
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -668,6 +841,60 @@ fun NFCWriterScreen(
                 Spacer(modifier = Modifier.height(16.dp))
 
                 Text(
+                    text = "Read Options",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                ReadOptionRow(
+                    label = "Last Error Command",
+                    checked = readOptionLastError,
+                    onCheckedChange = onReadOptionLastErrorChange,
+                    enabled = controlsEnabled
+                )
+                ReadOptionRow(
+                    label = "System Codes (0x85)",
+                    checked = readOptionSystemCodes,
+                    onCheckedChange = onReadOptionSystemCodesChange,
+                    enabled = controlsEnabled
+                )
+                ReadOptionRow(
+                    label = "Service Codes (0x84)",
+                    checked = readOptionServiceCodes,
+                    onCheckedChange = onReadOptionServiceCodesChange,
+                    enabled = controlsEnabled
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = readOptionCustomBlock,
+                        onCheckedChange = onReadOptionCustomBlockChange,
+                        enabled = controlsEnabled
+                    )
+                    Text(
+                        text = "Custom Block 読み取り",
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(start = 8.dp)
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    OutlinedTextField(
+                        value = readCustomBlockNumber,
+                        onValueChange = { handleCustomBlockInput(it) },
+                        label = { Text("ブロック番号 (0-255)") },
+                        modifier = Modifier.width(160.dp),
+                        singleLine = true,
+                        enabled = controlsEnabled && readOptionCustomBlock,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        supportingText = { Text("10進数で入力") }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
                     text = "書き込み対象",
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.padding(bottom = 8.dp)
@@ -677,13 +904,13 @@ fun NFCWriterScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 4.dp)
-                            .clickable(enabled = !isWriteMode) { onCommandChange(type) },
+                            .clickable(enabled = controlsEnabled) { onCommandChange(type) },
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(
                             selected = selectedCommand == type,
-                            onClick = { onCommandChange(type) },
-                            enabled = !isWriteMode
+                            onClick = { if (controlsEnabled) onCommandChange(type) },
+                            enabled = controlsEnabled
                         )
                         Text(
                             text = type.label,
@@ -705,7 +932,7 @@ fun NFCWriterScreen(
                             label = { Text("新しいIDm (16桁16進数)") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            enabled = !isWriteMode,
+                            enabled = controlsEnabled,
                             supportingText = { Text("例: DEADBEEF01010101 (8バイト)") }
                         )
 
@@ -719,7 +946,7 @@ fun NFCWriterScreen(
                             label = { Text("PMm (任意 16桁)") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            enabled = !isWriteMode,
+                            enabled = controlsEnabled,
                             supportingText = { Text("省略時はデフォルト値を使用します") }
                         )
                     }
@@ -733,7 +960,7 @@ fun NFCWriterScreen(
                             label = { Text("System Codes") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            enabled = !isWriteMode,
+                            enabled = controlsEnabled,
                             supportingText = { Text("最大4件・各4桁 (例: 12FC8000)") }
                         )
                     }
@@ -747,7 +974,7 @@ fun NFCWriterScreen(
                             label = { Text("Service Codes") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            enabled = !isWriteMode,
+                            enabled = controlsEnabled,
                             supportingText = { Text("最大4件・各4桁 (例: 100B200B)") }
                         )
                     }
@@ -756,6 +983,7 @@ fun NFCWriterScreen(
                         OutlinedTextField(
                             value = rawBlockNumberInput,
                             onValueChange = { newValue ->
+                                if (!controlsEnabled) return@OutlinedTextField
                                 if (newValue.length <= 2 && newValue.all { it.isDigit() }) {
                                     onRawBlockNumberChange(newValue)
                                 } else if (newValue.isEmpty()) {
@@ -765,7 +993,7 @@ fun NFCWriterScreen(
                             label = { Text("ブロック番号 (0〜11)") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            enabled = !isWriteMode,
+                            enabled = controlsEnabled,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
                         )
 
@@ -774,12 +1002,13 @@ fun NFCWriterScreen(
                         OutlinedTextField(
                             value = rawDataInput,
                             onValueChange = { newValue ->
+                                if (!controlsEnabled) return@OutlinedTextField
                                 tryAcceptHexInput(newValue, 32)?.let(onRawDataChange)
                             },
                             label = { Text("16バイトのデータ (32桁16進数)") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            enabled = !isWriteMode,
+                            enabled = controlsEnabled,
                             supportingText = { Text("例: 00112233445566778899AABBCCDDEEFF") }
                         )
                     }
@@ -787,13 +1016,42 @@ fun NFCWriterScreen(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                Button(
-                    onClick = onWriteClick,
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = isWriteButtonEnabled
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = onReadClick,
+                        modifier = Modifier.weight(1f),
+                        enabled = isReadButtonEnabled
+                    ) {
+                        Text(
+                            text = if (isReadMode) "Read待機中..." else "Read",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+
+                    Button(
+                        onClick = onWriteClick,
+                        modifier = Modifier.weight(1f),
+                        enabled = isWriteButtonEnabled
+                    ) {
+                        Text(
+                            text = if (isWriteMode) "書き込み待機中..." else "Write",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = onCancelClick,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = isCancelButtonEnabled
                 ) {
                     Text(
-                        text = if (isWriteMode) "書き込み待機中..." else "Write",
+                        text = "Cancel",
                         style = MaterialTheme.typography.titleMedium
                     )
                 }
@@ -829,6 +1087,32 @@ fun NFCWriterScreen(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun ReadOptionRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Checkbox(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(start = 8.dp)
+        )
     }
 }
 
