@@ -30,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import kotlin.math.min
 import jp.muo.silicarw.ui.theme.SiliCaRWTheme
 
 enum class WriteCommandType(val label: String) {
@@ -55,9 +56,11 @@ class MainActivity : ComponentActivity() {
     private var isWriteMode by mutableStateOf(false)
     private var pendingWriteRequest by mutableStateOf<WriteRequest?>(null)
     private var debugInfo by mutableStateOf("")
+    private var lastErrorCommand by mutableStateOf("未取得")
 
     companion object {
         private const val TAG = "NFCWriter"
+        private const val COMMAND_READ = 0x06.toByte()
         private const val COMMAND_WRITE = 0x08.toByte()
         private const val MAX_SYSTEM = 4
         private const val MAX_SERVICE = 4
@@ -70,6 +73,11 @@ class MainActivity : ComponentActivity() {
         val data: ByteArray,
         val description: String,
         val verifyIdm: ByteArray? = null
+    )
+
+    private data class BlockOperationResult(
+        val success: Boolean,
+        val errorMessage: String? = null
     )
 
     private fun onWriteButtonClick() {
@@ -230,6 +238,7 @@ class MainActivity : ComponentActivity() {
                         isWriteMode = isWriteMode,
                         isWriteButtonEnabled = canWrite,
                         debugInfo = debugInfo,
+                        lastErrorCommand = lastErrorCommand,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -340,6 +349,16 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "Manufacturer: ${nfcF.manufacturer.toHexString()}")
             Log.d(TAG, "System Code: ${nfcF.systemCode.toHexString()}")
 
+            // エラーコマンド履歴を取得
+            val errorCommand = fetchLastErrorCommand(nfcF, idm)
+            if (errorCommand != null) {
+                lastErrorCommand = errorCommand
+                Log.d(TAG, "Last error command: $errorCommand")
+            } else {
+                lastErrorCommand = "取得失敗"
+                Log.w(TAG, "Unable to read last error command")
+            }
+
             val pendingRequest = pendingWriteRequest
             if (isWriteMode && pendingRequest != null) {
                 Log.d(TAG, "Write mode active for ${pendingRequest.description}")
@@ -355,8 +374,8 @@ class MainActivity : ComponentActivity() {
                     return
                 }
 
-                val writeSuccess = writeBlock(nfcF, idm, pendingRequest.block, pendingRequest.data)
-                if (writeSuccess) {
+                val writeResult = writeBlock(nfcF, idm, pendingRequest.block, pendingRequest.data)
+                if (writeResult.success) {
                     if (pendingRequest.verifyIdm != null) {
                         val targetIdm = pendingRequest.verifyIdm.toHexString()
 
@@ -391,8 +410,9 @@ class MainActivity : ComponentActivity() {
                         debugInfo = "Write OK"
                     }
                 } else {
-                    statusMessage = "書き込み失敗\n${pendingRequest.description}"
-                    debugInfo = "Write FAILED"
+                    val errorMessage = writeResult.errorMessage ?: "詳細情報なし"
+                    statusMessage = "書き込み失敗\n${pendingRequest.description}\n$errorMessage"
+                    debugInfo = "Write FAILED: $errorMessage"
                 }
 
                 isWriteMode = false
@@ -421,14 +441,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun writeBlock(nfcF: NfcF, currentIdm: ByteArray, block: Int, data: ByteArray): Boolean {
+    private fun writeBlock(
+        nfcF: NfcF,
+        currentIdm: ByteArray,
+        block: Int,
+        data: ByteArray
+    ): BlockOperationResult {
         if (block !in 0..0xFF) {
-            Log.e(TAG, "Invalid block number: $block")
-            return false
+            val message = "Invalid block number: $block"
+            Log.e(TAG, message)
+            return BlockOperationResult(false, message)
         }
         if (data.size != 16) {
-            Log.e(TAG, "Data must be exactly 16 bytes, got ${data.size}")
-            return false
+            val message = "Data must be exactly 16 bytes, got ${data.size}"
+            Log.e(TAG, message)
+            return BlockOperationResult(false, message)
         }
 
         val cmdData = byteArrayOf(
@@ -454,14 +481,96 @@ class MainActivity : ComponentActivity() {
             if (response.size >= 11 && response[1] == 0x09.toByte()) {
                 val statusFlag1 = response[9]
                 val statusFlag2 = response[10]
-                statusFlag1 == 0x00.toByte() && statusFlag2 == 0x00.toByte()
+                if (statusFlag1 == 0x00.toByte() && statusFlag2 == 0x00.toByte()) {
+                    BlockOperationResult(true, null)
+                } else {
+                    val message = "ステータスフラグ: %02X %02X".format(
+                        statusFlag1,
+                        statusFlag2
+                    )
+                    Log.e(TAG, "Write failed, $message")
+                    BlockOperationResult(false, message)
+                }
             } else {
-                false
+                val message = "不正なレスポンス: ${response.toHexString()}"
+                Log.e(TAG, message)
+                BlockOperationResult(false, message)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error writing to tag", e)
-            false
+            val message = "通信エラー: ${e.message ?: e.javaClass.simpleName}"
+            BlockOperationResult(false, message)
         }
+    }
+
+    private fun readSystemBlocks(nfcF: NfcF, currentIdm: ByteArray, blockList: ByteArray): ByteArray? {
+        if (blockList.isEmpty() || blockList.size % 2 != 0) {
+            Log.e(TAG, "Invalid block list for read: ${blockList.toHexString()}")
+            return null
+        }
+
+        val blockCount = blockList.size / 2
+        val cmdData = byteArrayOf(
+            0x01,           // service count
+            0xFF.toByte(),
+            0xFF.toByte(),
+            blockCount.toByte()
+        ) + blockList
+
+        val command = byteArrayOf(
+            (1 + 1 + currentIdm.size + cmdData.size).toByte(),
+            COMMAND_READ
+        ) + currentIdm + cmdData
+
+        Log.d(TAG, "Sending read command: ${command.toHexString()}")
+
+        return try {
+            val response = nfcF.transceive(command)
+            Log.d(TAG, "Read response: ${response.toHexString()}")
+
+            if (response.size < 13 || response[1] != 0x07.toByte()) {
+                Log.e(TAG, "Invalid read response header")
+                return null
+            }
+            val statusFlag1 = response[10]
+            val statusFlag2 = response[11]
+            if (statusFlag1 != 0x00.toByte() || statusFlag2 != 0x00.toByte()) {
+                Log.e(TAG, "Read failed: status flags $statusFlag1 $statusFlag2")
+                return null
+            }
+            val blocksReturned = response[12].toInt() and 0xFF
+            val dataStart = 13
+            val dataEnd = dataStart + blocksReturned * 16
+            if (response.size < dataEnd) {
+                Log.e(TAG, "Incomplete block data in response")
+                return null
+            }
+            response.copyOfRange(dataStart, dataEnd)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reading blocks", e)
+            null
+        }
+    }
+
+    private fun fetchLastErrorCommand(nfcF: NfcF, currentIdm: ByteArray): String? {
+        val blockList = byteArrayOf(
+            0x80.toByte(), 0xE0.toByte(),
+            0x80.toByte(), 0xE1.toByte()
+        )
+        val blockData = readSystemBlocks(nfcF, currentIdm, blockList) ?: return null
+        if (blockData.isEmpty()) return null
+
+        val length = blockData[0].toInt() and 0xFF
+        val available = blockData.size - 1
+        if (available <= 0) {
+            return "なし"
+        }
+        val actualLength = min(length, available)
+        if (actualLength <= 0) {
+            return "なし"
+        }
+        val bytes = blockData.copyOfRange(1, 1 + actualLength)
+        return bytes.joinToString(" ") { "%02X".format(it) }
     }
 
     private fun padToBlock(bytes: ByteArray): ByteArray {
@@ -506,6 +615,7 @@ fun NFCWriterScreen(
     isWriteMode: Boolean,
     isWriteButtonEnabled: Boolean,
     debugInfo: String,
+    lastErrorCommand: String,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -703,6 +813,20 @@ fun NFCWriterScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                 }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                HorizontalDivider()
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "最後に取得したエラーコマンド:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = if (lastErrorCommand.isNotBlank()) lastErrorCommand else "未取得",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
             }
         }
     }
