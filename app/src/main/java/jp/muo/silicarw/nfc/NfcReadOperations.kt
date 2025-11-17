@@ -60,6 +60,19 @@ object NfcReadOperations {
         return codes
     }
 
+    fun readIdmPmm(
+        nfcF: NfcF,
+        currentIdm: ByteArray
+    ): Pair<String, String>? {
+        val blockData = readSingleSystemBlock(nfcF, currentIdm, 0x83) ?: return null
+        if (blockData.size < 16) {
+            return null
+        }
+        val idm = blockData.copyOfRange(0, 8).toHexString()
+        val pmm = blockData.copyOfRange(8, 16).toHexString()
+        return idm to pmm
+    }
+
     fun formatCodeListDisplay(codes: List<String>?): String {
         return when {
             codes == null -> "読み取り失敗"

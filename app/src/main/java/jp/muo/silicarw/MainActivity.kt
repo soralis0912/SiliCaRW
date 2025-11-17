@@ -25,17 +25,32 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import jp.muo.silicarw.nfc.NfcReadOperations
 import jp.muo.silicarw.nfc.NfcWriteOperations
+import jp.muo.silicarw.ui.tabs.HistoryTabContent
+import jp.muo.silicarw.ui.tabs.ReadTabContent
+import jp.muo.silicarw.ui.tabs.WriteTabContent
 import jp.muo.silicarw.ui.theme.SiliCaRWTheme
 import jp.muo.silicarw.util.hexStringToByteArray
+import jp.muo.silicarw.util.tryAcceptHexInput
 import jp.muo.silicarw.util.toHexString
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import org.json.JSONArray
+import org.json.JSONObject
 
 enum class WriteCommandType(val label: String) {
     IDM("IDm / PMm"),
@@ -43,6 +58,18 @@ enum class WriteCommandType(val label: String) {
     SERVICE_CODES("Service Codes"),
     RAW_BLOCK("Raw Block")
 }
+
+enum class MainTab(val label: String) {
+    READ("Read"),
+    WRITE("Write"),
+    HISTORY("History")
+}
+
+data class HistoryEntry(
+    val id: Long,
+    val timestamp: String,
+    val content: String
+)
 
 class MainActivity : ComponentActivity() {
     private var nfcAdapter: NfcAdapter? = null
@@ -67,6 +94,9 @@ class MainActivity : ComponentActivity() {
     private var readOptionServiceCodes by mutableStateOf(false)
     private var readOptionCustomBlock by mutableStateOf(false)
     private var readCustomBlockNumber by mutableStateOf("0")
+    private var selectedTab by mutableStateOf(MainTab.READ)
+    private val readHistory = mutableStateListOf<HistoryEntry>()
+    private val historyFileName = "read_history.json"
 
     companion object {
         private const val TAG = "NFCWriter"
@@ -87,6 +117,76 @@ class MainActivity : ComponentActivity() {
     private fun setIdleStatus() {
         statusMessage = IDLE_STATUS_MESSAGE
         debugInfo = "Idle"
+    }
+
+    private fun appendReadHistory(summary: String) {
+        val now = System.currentTimeMillis()
+        val formatter = SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.getDefault())
+        val entry = HistoryEntry(
+            id = now,
+            timestamp = formatter.format(Date(now)),
+            content = summary
+        )
+        readHistory.add(0, entry)
+        persistHistory()
+    }
+
+    private fun historyFile(): File = File(filesDir, historyFileName)
+
+    private fun loadHistoryFromFile(): List<HistoryEntry> {
+        val file = historyFile()
+        if (!file.exists()) {
+            return emptyList()
+        }
+        return try {
+            val json = JSONArray(file.readText())
+            buildList {
+                for (i in 0 until json.length()) {
+                    val obj = json.getJSONObject(i)
+                    add(
+                        HistoryEntry(
+                            id = obj.optLong("id"),
+                            timestamp = obj.optString("timestamp"),
+                            content = obj.optString("content")
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load history", e)
+            emptyList()
+        }
+    }
+
+    private fun persistHistory() {
+        try {
+            val array = JSONArray()
+            readHistory.forEach { entry ->
+                val obj = JSONObject()
+                obj.put("id", entry.id)
+                obj.put("timestamp", entry.timestamp)
+                obj.put("content", entry.content)
+                array.put(obj)
+            }
+            historyFile().writeText(array.toString())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save history", e)
+        }
+    }
+
+    private fun deleteHistoryEntry(entryId: Long) {
+        val index = readHistory.indexOfFirst { it.id == entryId }
+        if (index >= 0) {
+            readHistory.removeAt(index)
+            persistHistory()
+        }
+    }
+
+    private fun clearHistoryEntries() {
+        if (readHistory.isNotEmpty()) {
+            readHistory.clear()
+            persistHistory()
+        }
     }
 
     private fun onWriteButtonClick() {
@@ -218,6 +318,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        readHistory.addAll(loadHistoryFromFile())
+
         Log.d(TAG, "onCreate called")
 
         // NFC初期化
@@ -252,6 +354,8 @@ class MainActivity : ComponentActivity() {
                     NFCWriterScreen(
                         statusMessage = statusMessage,
                         currentIdm = currentIdm,
+                        selectedTab = selectedTab,
+                        onTabSelected = { newTab -> if (!isReadMode && !isWriteMode) selectedTab = newTab },
                         selectedCommand = selectedCommand,
                         onCommandChange = { selectedCommand = it },
                         idmInput = idmInput,
@@ -276,6 +380,7 @@ class MainActivity : ComponentActivity() {
                         onReadOptionCustomBlockChange = { readOptionCustomBlock = it },
                         readCustomBlockNumber = readCustomBlockNumber,
                         onReadCustomBlockNumberChange = { readCustomBlockNumber = it },
+                        readHistory = readHistory,
                         onReadClick = { onReadButtonClick() },
                         onWriteClick = { onWriteButtonClick() },
                         onCancelClick = { cancelPendingOperation() },
@@ -462,7 +567,16 @@ class MainActivity : ComponentActivity() {
                 pendingWriteRequest = null
             } else if (isReadMode) {
                 Log.d(TAG, "Manual read mode active")
-                val outputs = mutableListOf("IDm: $currentIdm")
+                val outputs = mutableListOf<String>()
+
+                val idmPmm = NfcReadOperations.readIdmPmm(nfcF, idm)
+                if (idmPmm != null) {
+                    outputs += "IDm: ${idmPmm.first}"
+                    outputs += "PMm: ${idmPmm.second}"
+                } else {
+                    outputs += "IDm: $currentIdm"
+                    outputs += "PMm: 取得失敗"
+                }
 
                 if (readOptionLastError) {
                     val lastError = NfcReadOperations.fetchLastErrorCommand(nfcF, idm)
@@ -506,6 +620,7 @@ class MainActivity : ComponentActivity() {
                 val summary = outputs.joinToString("\n")
                 statusMessage = "読み取り結果:\n$summary"
                 debugInfo = "Manual Read OK"
+                appendReadHistory(summary)
                 isReadMode = false
             } else {
                 Log.w(TAG, "Tag received but no active operation")
@@ -536,6 +651,8 @@ class MainActivity : ComponentActivity() {
 fun NFCWriterScreen(
     statusMessage: String,
     currentIdm: String,
+    selectedTab: MainTab,
+    onTabSelected: (MainTab) -> Unit,
     selectedCommand: WriteCommandType,
     onCommandChange: (WriteCommandType) -> Unit,
     idmInput: String,
@@ -560,6 +677,7 @@ fun NFCWriterScreen(
     onReadOptionCustomBlockChange: (Boolean) -> Unit,
     readCustomBlockNumber: String,
     onReadCustomBlockNumberChange: (String) -> Unit,
+    readHistory: List<HistoryEntry>,
     onReadClick: () -> Unit,
     onWriteClick: () -> Unit,
     onCancelClick: () -> Unit,
@@ -573,6 +691,7 @@ fun NFCWriterScreen(
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
+    val clipboardManager = LocalClipboardManager.current
     val controlsEnabled = !isReadMode && !isWriteMode
     fun handleCustomBlockInput(newValue: String) {
         if (!controlsEnabled) return
@@ -588,6 +707,7 @@ fun NFCWriterScreen(
             onReadCustomBlockNumberChange(parsed.toString())
         }
     }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -596,9 +716,7 @@ fun NFCWriterScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Top
     ) {
-        Card(
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        Card(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(16.dp),
                 horizontalAlignment = Alignment.Start
@@ -636,220 +754,95 @@ fun NFCWriterScreen(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                Text(
-                    text = "Read Options",
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-                ReadOptionRow(
-                    label = "Last Error Command",
-                    checked = readOptionLastError,
-                    onCheckedChange = onReadOptionLastErrorChange,
-                    enabled = controlsEnabled
-                )
-                ReadOptionRow(
-                    label = "System Codes (0x85)",
-                    checked = readOptionSystemCodes,
-                    onCheckedChange = onReadOptionSystemCodesChange,
-                    enabled = controlsEnabled
-                )
-                ReadOptionRow(
-                    label = "Service Codes (0x84)",
-                    checked = readOptionServiceCodes,
-                    onCheckedChange = onReadOptionServiceCodesChange,
-                    enabled = controlsEnabled
-                )
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Checkbox(
-                        checked = readOptionCustomBlock,
-                        onCheckedChange = onReadOptionCustomBlockChange,
-                        enabled = controlsEnabled
-                    )
-                    Text(
-                        text = "Custom Block 読み取り",
-                        style = MaterialTheme.typography.bodyLarge,
-                        modifier = Modifier.padding(start = 8.dp)
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
-                    OutlinedTextField(
-                        value = readCustomBlockNumber,
-                        onValueChange = { handleCustomBlockInput(it) },
-                        label = { Text("ブロック番号 (0-255)") },
-                        modifier = Modifier.width(160.dp),
-                        singleLine = true,
-                        enabled = controlsEnabled && readOptionCustomBlock,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        supportingText = { Text("10進数で入力") }
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Text(
-                    text = "書き込み対象",
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-                WriteCommandType.values().forEach { type ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp)
-                            .clickable(enabled = controlsEnabled) { onCommandChange(type) },
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = selectedCommand == type,
-                            onClick = { if (controlsEnabled) onCommandChange(type) },
-                            enabled = controlsEnabled
-                        )
-                        Text(
-                            text = type.label,
-                            style = MaterialTheme.typography.bodyLarge,
-                            modifier = Modifier.padding(start = 8.dp)
+                TabRow(selectedTabIndex = selectedTab.ordinal) {
+                    MainTab.values().forEach { tab ->
+                        Tab(
+                            selected = selectedTab == tab,
+                            onClick = { if (controlsEnabled) onTabSelected(tab) },
+                            enabled = controlsEnabled || selectedTab == tab,
+                            text = { Text(tab.label) }
                         )
                     }
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                when (selectedCommand) {
-                    WriteCommandType.IDM -> {
-                        OutlinedTextField(
-                            value = idmInput,
-                            onValueChange = { newValue ->
-                                tryAcceptHexInput(newValue, 16)?.let(onInputIdmChange)
-                            },
-                            label = { Text("新しいIDm (16桁16進数)") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = controlsEnabled,
-                            supportingText = { Text("例: DEADBEEF01010101 (8バイト)") }
+                when (selectedTab) {
+                    MainTab.READ -> {
+                        ReadTabContent(
+                            readOptionLastError = readOptionLastError,
+                            onReadOptionLastErrorChange = onReadOptionLastErrorChange,
+                            readOptionSystemCodes = readOptionSystemCodes,
+                            onReadOptionSystemCodesChange = onReadOptionSystemCodesChange,
+                            readOptionServiceCodes = readOptionServiceCodes,
+                            onReadOptionServiceCodesChange = onReadOptionServiceCodesChange,
+                            readOptionCustomBlock = readOptionCustomBlock,
+                            onReadOptionCustomBlockChange = onReadOptionCustomBlockChange,
+                            readCustomBlockNumber = readCustomBlockNumber,
+                            onReadCustomBlockNumberChange = { handleCustomBlockInput(it) },
+                            controlsEnabled = controlsEnabled,
+                            isReadMode = isReadMode,
+                            isReadButtonEnabled = isReadButtonEnabled,
+                            isCancelButtonEnabled = isCancelButtonEnabled,
+                            onReadClick = onReadClick,
+                            onCancelClick = onCancelClick
                         )
+                    }
+
+                    MainTab.WRITE -> {
+                        WriteTabContent(
+                            controlsEnabled = controlsEnabled,
+                            selectedCommand = selectedCommand,
+                            onCommandChange = onCommandChange,
+                            idmInput = idmInput,
+                            onInputIdmChange = onInputIdmChange,
+                            pmmInput = pmmInput,
+                            onPmmChange = onPmmChange,
+                            systemCodesInput = systemCodesInput,
+                            onSystemCodesChange = onSystemCodesChange,
+                            serviceCodesInput = serviceCodesInput,
+                            onServiceCodesChange = onServiceCodesChange,
+                            rawBlockNumberInput = rawBlockNumberInput,
+                            onRawBlockNumberChange = onRawBlockNumberChange,
+                            rawDataInput = rawDataInput,
+                            onRawDataChange = onRawDataChange
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Button(
+                            onClick = onWriteClick,
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = isWriteButtonEnabled
+                        ) {
+                            Text(
+                                text = if (isWriteMode) "書き込み待機中..." else "Write",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                        }
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        OutlinedTextField(
-                            value = pmmInput,
-                            onValueChange = { newValue ->
-                                tryAcceptHexInput(newValue, 16)?.let(onPmmChange)
-                            },
-                            label = { Text("PMm (任意 16桁)") },
+                        Button(
+                            onClick = onCancelClick,
                             modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = controlsEnabled,
-                            supportingText = { Text("省略時はデフォルト値を使用します") }
-                        )
+                            enabled = isCancelButtonEnabled
+                        ) {
+                            Text(
+                                text = "Cancel",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                        }
                     }
 
-                    WriteCommandType.SYSTEM_CODES -> {
-                        OutlinedTextField(
-                            value = systemCodesInput,
-                            onValueChange = { newValue ->
-                                tryAcceptHexInput(newValue, 16)?.let(onSystemCodesChange)
-                            },
-                            label = { Text("System Codes") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = controlsEnabled,
-                            supportingText = { Text("最大4件・各4桁 (例: 12FC8000)") }
+                    MainTab.HISTORY -> {
+                        HistoryTabContent(
+                            readHistory = readHistory,
+                            onCopyEntry = { clipboardManager.setText(AnnotatedString(it)) },
+                            onDeleteEntry = { entry -> this@MainActivity.deleteHistoryEntry(entry.id) },
+                            onClearAll = { this@MainActivity.clearHistoryEntries() }
                         )
                     }
-
-                    WriteCommandType.SERVICE_CODES -> {
-                        OutlinedTextField(
-                            value = serviceCodesInput,
-                            onValueChange = { newValue ->
-                                tryAcceptHexInput(newValue, 16)?.let(onServiceCodesChange)
-                            },
-                            label = { Text("Service Codes") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = controlsEnabled,
-                            supportingText = { Text("最大4件・各4桁 (例: 100B200B)") }
-                        )
-                    }
-
-                    WriteCommandType.RAW_BLOCK -> {
-                        OutlinedTextField(
-                            value = rawBlockNumberInput,
-                            onValueChange = { newValue ->
-                                if (!controlsEnabled) return@OutlinedTextField
-                                if (newValue.length <= 2 && newValue.all { it.isDigit() }) {
-                                    onRawBlockNumberChange(newValue)
-                                } else if (newValue.isEmpty()) {
-                                    onRawBlockNumberChange("")
-                                }
-                            },
-                            label = { Text("ブロック番号 (0〜11)") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = controlsEnabled,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                        )
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        OutlinedTextField(
-                            value = rawDataInput,
-                            onValueChange = { newValue ->
-                                if (!controlsEnabled) return@OutlinedTextField
-                                tryAcceptHexInput(newValue, 32)?.let(onRawDataChange)
-                            },
-                            label = { Text("16バイトのデータ (32桁16進数)") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            enabled = controlsEnabled,
-                            supportingText = { Text("例: 00112233445566778899AABBCCDDEEFF") }
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Button(
-                        onClick = onReadClick,
-                        modifier = Modifier.weight(1f),
-                        enabled = isReadButtonEnabled
-                    ) {
-                        Text(
-                            text = if (isReadMode) "Read待機中..." else "Read",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                    }
-
-                    Button(
-                        onClick = onWriteClick,
-                        modifier = Modifier.weight(1f),
-                        enabled = isWriteButtonEnabled
-                    ) {
-                        Text(
-                            text = if (isWriteMode) "書き込み待機中..." else "Write",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Button(
-                    onClick = onCancelClick,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = isCancelButtonEnabled
-                ) {
-                    Text(
-                        text = "Cancel",
-                        style = MaterialTheme.typography.titleMedium
-                    )
                 }
 
                 if (currentIdm.isNotEmpty()) {
@@ -884,46 +877,4 @@ fun NFCWriterScreen(
             }
         }
     }
-}
-
-@Composable
-private fun ReadOptionRow(
-    label: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    enabled: Boolean
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Checkbox(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            enabled = enabled
-        )
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyLarge,
-            modifier = Modifier.padding(start = 8.dp)
-        )
-    }
-}
-
-private fun tryAcceptHexInput(newValue: String, maxLength: Int? = null): String? {
-    val candidate = newValue.uppercase()
-    if (!candidate.all { it.isHexDigitChar() }) {
-        return null
-    }
-    if (maxLength != null && candidate.length > maxLength) {
-        return null
-    }
-    return candidate
-}
-
-private fun Char.isHexDigitChar(): Boolean {
-    val upper = this.uppercaseChar()
-    return upper in '0'..'9' || upper in 'A'..'F'
 }
