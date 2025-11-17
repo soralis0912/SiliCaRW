@@ -31,8 +31,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import kotlin.math.min
+import jp.muo.silicarw.nfc.NfcReadOperations
+import jp.muo.silicarw.nfc.NfcWriteOperations
 import jp.muo.silicarw.ui.theme.SiliCaRWTheme
+import jp.muo.silicarw.util.hexStringToByteArray
+import jp.muo.silicarw.util.toHexString
 
 enum class WriteCommandType(val label: String) {
     IDM("IDm / PMm"),
@@ -67,8 +70,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "NFCWriter"
-        private const val COMMAND_READ = 0x06.toByte()
-        private const val COMMAND_WRITE = 0x08.toByte()
         private const val MAX_SYSTEM = 4
         private const val MAX_SERVICE = 4
         private const val IDLE_STATUS_MESSAGE = "ReadまたはWriteボタンを押してからタグをかざしてください"
@@ -81,11 +82,6 @@ class MainActivity : ComponentActivity() {
         val data: ByteArray,
         val description: String,
         val verifyIdm: ByteArray? = null
-    )
-
-    private data class BlockOperationResult(
-        val success: Boolean,
-        val errorMessage: String? = null
     )
 
     private fun setIdleStatus() {
@@ -177,7 +173,7 @@ class MainActivity : ComponentActivity() {
                 val bytes = hexStringToByteArray(clean)
                 WriteRequest(
                     block = 0x85,
-                    data = padToBlock(bytes),
+                    data = NfcWriteOperations.padToBlock(bytes),
                     description = "System Codes 書き込み"
                 )
             }
@@ -197,7 +193,7 @@ class MainActivity : ComponentActivity() {
                 }
                 WriteRequest(
                     block = 0x84,
-                    data = padToBlock(swapped),
+                    data = NfcWriteOperations.padToBlock(swapped),
                     description = "Service Codes 書き込み"
                 )
             }
@@ -421,7 +417,7 @@ class MainActivity : ComponentActivity() {
                     return
                 }
 
-                val writeResult = writeBlock(nfcF, idm, pendingRequest.block, pendingRequest.data)
+                val writeResult = NfcWriteOperations.writeBlock(nfcF, idm, pendingRequest.block, pendingRequest.data)
                 if (writeResult.success) {
                     if (pendingRequest.verifyIdm != null) {
                         val targetIdm = pendingRequest.verifyIdm.toHexString()
@@ -469,7 +465,7 @@ class MainActivity : ComponentActivity() {
                 val outputs = mutableListOf("IDm: $currentIdm")
 
                 if (readOptionLastError) {
-                    val lastError = fetchLastErrorCommand(nfcF, idm)
+                    val lastError = NfcReadOperations.fetchLastErrorCommand(nfcF, idm)
                     if (lastError != null) {
                         lastErrorCommand = lastError
                         outputs += "Last Error: $lastError"
@@ -480,17 +476,31 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (readOptionSystemCodes) {
-                    val codes = readCodeListBlock(nfcF, idm, blockNumber = 0x85, swapBytes = false)
-                    outputs += "System Codes: ${formatCodeListDisplay(codes)}"
+                    val codes = NfcReadOperations.readCodeListBlock(
+                        nfcF,
+                        idm,
+                        blockNumber = 0x85,
+                        swapBytes = false
+                    )
+                    outputs += "System Codes: ${NfcReadOperations.formatCodeListDisplay(codes)}"
                 }
 
                 if (readOptionServiceCodes) {
-                    val codes = readCodeListBlock(nfcF, idm, blockNumber = 0x84, swapBytes = true)
-                    outputs += "Service Codes: ${formatCodeListDisplay(codes)}"
+                    val codes = NfcReadOperations.readCodeListBlock(
+                        nfcF,
+                        idm,
+                        blockNumber = 0x84,
+                        swapBytes = true
+                    )
+                    outputs += "Service Codes: ${NfcReadOperations.formatCodeListDisplay(codes)}"
                 }
 
                 if (readOptionCustomBlock) {
-                    outputs += readCustomBlockDisplay(nfcF, idm)
+                    outputs += NfcReadOperations.readCustomBlockDisplay(
+                        nfcF,
+                        idm,
+                        readCustomBlockNumber
+                    )
                 }
 
                 val summary = outputs.joinToString("\n")
@@ -520,220 +530,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun writeBlock(
-        nfcF: NfcF,
-        currentIdm: ByteArray,
-        block: Int,
-        data: ByteArray
-    ): BlockOperationResult {
-        if (block !in 0..0xFF) {
-            val message = "Invalid block number: $block"
-            Log.e(TAG, message)
-            return BlockOperationResult(false, message)
-        }
-        if (data.size != 16) {
-            val message = "Data must be exactly 16 bytes, got ${data.size}"
-            Log.e(TAG, message)
-            return BlockOperationResult(false, message)
-        }
-
-        val cmdData = byteArrayOf(
-            0x01,           // service count
-            0xFF.toByte(),  // service code (little endian)
-            0xFF.toByte(),
-            0x01,           // block count
-            0x80.toByte(),  // block list element (2-byte mode)
-            block.toByte()  // block number
-        ) + data
-
-        val command = byteArrayOf(
-            (1 + 1 + currentIdm.size + cmdData.size).toByte(),
-            COMMAND_WRITE
-        ) + currentIdm + cmdData
-
-        Log.d(TAG, "Sending block $block write command: ${command.toHexString()}")
-
-        return try {
-            val response = nfcF.transceive(command)
-            Log.d(TAG, "Response: ${response.toHexString()}")
-
-            if (response.size >= 11 && response[1] == 0x09.toByte()) {
-                val statusFlag1 = response[9]
-                val statusFlag2 = response[10]
-                if (statusFlag1 == 0x00.toByte() && statusFlag2 == 0x00.toByte()) {
-                    BlockOperationResult(true, null)
-                } else {
-                    val message = "ステータスフラグ: %02X %02X".format(
-                        statusFlag1,
-                        statusFlag2
-                    )
-                    Log.e(TAG, "Write failed, $message")
-                    BlockOperationResult(false, message)
-                }
-            } else {
-                val message = "不正なレスポンス: ${response.toHexString()}"
-                Log.e(TAG, message)
-                BlockOperationResult(false, message)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error writing to tag", e)
-            val message = "通信エラー: ${e.message ?: e.javaClass.simpleName}"
-            BlockOperationResult(false, message)
-        }
-    }
-
-    private fun readSystemBlocks(nfcF: NfcF, currentIdm: ByteArray, blockList: ByteArray): ByteArray? {
-        if (blockList.isEmpty() || blockList.size % 2 != 0) {
-            Log.e(TAG, "Invalid block list for read: ${blockList.toHexString()}")
-            return null
-        }
-
-        val blockCount = blockList.size / 2
-        val cmdData = byteArrayOf(
-            0x01,           // service count
-            0xFF.toByte(),
-            0xFF.toByte(),
-            blockCount.toByte()
-        ) + blockList
-
-        val command = byteArrayOf(
-            (1 + 1 + currentIdm.size + cmdData.size).toByte(),
-            COMMAND_READ
-        ) + currentIdm + cmdData
-
-        Log.d(TAG, "Sending read command: ${command.toHexString()}")
-
-        return try {
-            val response = nfcF.transceive(command)
-            Log.d(TAG, "Read response: ${response.toHexString()}")
-
-            if (response.size < 13 || response[1] != 0x07.toByte()) {
-                Log.e(TAG, "Invalid read response header")
-                return null
-            }
-            val statusFlag1 = response[10]
-            val statusFlag2 = response[11]
-            if (statusFlag1 != 0x00.toByte() || statusFlag2 != 0x00.toByte()) {
-                Log.e(TAG, "Read failed: status flags $statusFlag1 $statusFlag2")
-                return null
-            }
-            val blocksReturned = response[12].toInt() and 0xFF
-            val dataStart = 13
-            val dataEnd = dataStart + blocksReturned * 16
-            if (response.size < dataEnd) {
-                Log.e(TAG, "Incomplete block data in response")
-                return null
-            }
-            response.copyOfRange(dataStart, dataEnd)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error reading blocks", e)
-            null
-        }
-    }
-
-    private fun fetchLastErrorCommand(nfcF: NfcF, currentIdm: ByteArray): String? {
-        val blockList = byteArrayOf(
-            0x80.toByte(), 0xE0.toByte(),
-            0x80.toByte(), 0xE1.toByte()
-        )
-        val blockData = readSystemBlocks(nfcF, currentIdm, blockList) ?: return null
-        if (blockData.isEmpty()) return null
-
-        val length = blockData[0].toInt() and 0xFF
-        val available = blockData.size - 1
-        if (available <= 0) {
-            return "なし"
-        }
-        val actualLength = min(length, available)
-        if (actualLength <= 0) {
-            return "なし"
-        }
-        val bytes = blockData.copyOfRange(1, 1 + actualLength)
-        return bytes.joinToString(" ") { "%02X".format(it) }
-    }
-
-    private fun readSingleSystemBlock(
-        nfcF: NfcF,
-        currentIdm: ByteArray,
-        blockNumber: Int
-    ): ByteArray? {
-        if (blockNumber !in 0..0xFF) {
-            return null
-        }
-        val blockList = byteArrayOf(0x80.toByte(), blockNumber.toByte())
-        return readSystemBlocks(nfcF, currentIdm, blockList)
-    }
-
-    private fun readCodeListBlock(
-        nfcF: NfcF,
-        currentIdm: ByteArray,
-        blockNumber: Int,
-        swapBytes: Boolean
-    ): List<String>? {
-        val blockData = readSingleSystemBlock(nfcF, currentIdm, blockNumber) ?: return null
-        if (blockData.isEmpty()) {
-            return emptyList()
-        }
-
-        val codes = mutableListOf<String>()
-        var index = 0
-        while (index + 1 < blockData.size) {
-            val first = blockData[index]
-            val second = blockData[index + 1]
-            if (first == 0.toByte() && second == 0.toByte()) {
-                break
-            }
-            val pair = if (swapBytes) {
-                byteArrayOf(second, first)
-            } else {
-                byteArrayOf(first, second)
-            }
-            codes += pair.toHexString()
-            index += 2
-        }
-        return codes
-    }
-
-    private fun formatCodeListDisplay(codes: List<String>?): String {
-        return when {
-            codes == null -> "読み取り失敗"
-            codes.isEmpty() -> "なし"
-            else -> codes.joinToString(", ")
-        }
-    }
-
-    private fun readCustomBlockDisplay(nfcF: NfcF, currentIdm: ByteArray): String {
-        val blockNumber = readCustomBlockNumber.toIntOrNull()
-        if (blockNumber == null || blockNumber !in 0..0xFF) {
-            return "Block: 無効な番号"
-        }
-        val label = "Block %02X".format(blockNumber)
-        val data = readSingleSystemBlock(nfcF, currentIdm, blockNumber)
-        return if (data != null) {
-            "$label: ${data.toHexString()}"
-        } else {
-            "$label: 読み取り失敗"
-        }
-    }
-
-    private fun padToBlock(bytes: ByteArray): ByteArray {
-        return if (bytes.size >= 16) {
-            bytes.copyOf(16)
-        } else {
-            bytes + ByteArray(16 - bytes.size)
-        }
-    }
-
-    private fun ByteArray.toHexString(): String {
-        return this.joinToString("") { "%02X".format(it) }
-    }
-
-    private fun hexStringToByteArray(hex: String): ByteArray {
-        require(hex.length % 2 == 0) { "Hex string must have an even length" }
-        return ByteArray(hex.length / 2) { i ->
-            hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-        }
-    }
 }
 
 @Composable
