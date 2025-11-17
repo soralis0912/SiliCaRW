@@ -20,7 +20,7 @@ android {
     signingConfigs {
         // Local/dev keystore shipped in repository (android.jks)
         create("android") {
-            storeFile = rootProject.file("android.jks")
+            storeFile = file("android.jks")
             storePassword = "android"
             keyAlias = "android"
             keyPassword = "android"
